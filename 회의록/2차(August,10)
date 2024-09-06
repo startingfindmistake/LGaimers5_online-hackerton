@@ -1,0 +1,9 @@
+catboost Model
+variable Model
+이상치 처리, 결측값
+SMOTE를 활용, 파라미터 조정
+
+GPU 사용신청
+
+다음 회의 준비
+데이터스케일링, catboost Model, 앙상블 기법, XGBoost, Light GMB, autoML, SMOTE Use, Parameter
