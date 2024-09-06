@@ -1,0 +1,121 @@
+# Public Score : 0.1951219512195122
+import os
+import numpy as np
+import pandas as pd
+from catboost import CatBoostClassifier
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.feature_selection import RFE
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+
+# Constants
+ROOT_DIR = "data"
+RANDOM_STATE = 110
+N_FEATURES_TO_SELECT = 160
+
+# 데이터 로드
+train_data = pd.read_csv(os.path.join(ROOT_DIR, "train.csv"))
+test_data = pd.read_csv(os.path.join(ROOT_DIR, "test.csv"))
+
+# NaN 열 제거
+train_data.drop(columns=train_data.columns[train_data.isna().all()], inplace=True)
+test_data.drop(columns=test_data.columns[test_data.isna().all()], inplace=True)
+
+# Set_ID 열 제거
+test_data.drop(columns=['Set_ID'], inplace=True, errors='ignore')
+
+# 문자열 데이터 인코딩
+non_numeric_columns = train_data.select_dtypes(include=['object']).columns.tolist()
+if 'target' in non_numeric_columns:
+    non_numeric_columns.remove('target')
+
+label_encoders = {col: LabelEncoder().fit(pd.concat([train_data[col], test_data[col]], axis=0))
+                  for col in non_numeric_columns}
+
+for column, encoder in label_encoders.items():
+    train_data[column] = encoder.transform(train_data[column])
+    test_data[column] = encoder.transform(test_data[column])
+
+# 타겟 변환
+train_data["target"] = train_data["target"].map({'Normal': 0, 'AbNormal': 1})
+
+# 파생 변수 생성
+def create_features(data):
+    data['position_x_diff'] = data['CURE END POSITION X Collect Result_Dam'] - data['CURE START POSITION X Collect Result_Dam']
+    data['position_z_diff'] = data['CURE END POSITION Z Collect Result_Dam'] - data['CURE START POSITION Z Collect Result_Dam']
+    data['judge_diff'] = data['Insp Judge Code_Dam'].apply(lambda x: 1 if x == 'OK' else 0)
+    data['position_ratio_xz'] = data['CURE END POSITION X Collect Result_Dam'] / (data['CURE END POSITION Z Collect Result_Dam'] + 1)
+    data['position_theta_diff'] = data['CURE END POSITION Θ Collect Result_Dam'] - data['CURE START POSITION Θ Collect Result_Dam']
+
+    for col in ['CURE END POSITION X Collect Result_Dam', 
+                 'CURE END POSITION Z Collect Result_Dam', 
+                 'CURE END POSITION Θ Collect Result_Dam']:
+        data[f'{col}_log'] = np.log1p(data[col] - data[col].min() + 1)
+        data[f'{col}_sqrt'] = np.sqrt(data[col] - data[col].min() + 1)
+    
+
+
+create_features(train_data)
+create_features(test_data)
+
+# 특징과 타겟 분리
+features = [col for col in train_data.columns if col != 'target']
+train_x = train_data[features]
+train_y = train_data["target"]
+
+# 데이터 정규화
+scaler = StandardScaler()
+train_x = scaler.fit_transform(train_x)
+
+# RFE로 피처 선택
+base_model = RandomForestClassifier(random_state=RANDOM_STATE)
+rfe_selector = RFE(base_model, n_features_to_select=N_FEATURES_TO_SELECT, step=1)
+rfe_selector.fit(train_x, train_y)
+train_x_rfe = train_x[:, rfe_selector.support_]
+
+# Train-validation split
+train_x_rfe, val_x_rfe, train_y, val_y = train_test_split(train_x_rfe, train_y, test_size=0.3, random_state=RANDOM_STATE)
+
+# 클래스 가중치 계산
+class_weights = compute_class_weight('balanced', classes=[0, 1], y=train_y)
+
+# 개별 모델 설정
+catboost_model = CatBoostClassifier(iterations=700, depth=10, learning_rate=0.02, 
+                                    loss_function='Logloss', eval_metric='F1',
+                                    class_weights=class_weights, random_state=RANDOM_STATE, silent=True, l2_leaf_reg=5)
+
+xgb_model = XGBClassifier(scale_pos_weight=class_weights[1], reg_alpha=0.1, reg_lambda=1.0, random_state=RANDOM_STATE)
+lgb_model = LGBMClassifier(scale_pos_weight=class_weights[1], lambda_l1=0.1, lambda_l2=1.0, random_state=RANDOM_STATE)
+logistic_model = LogisticRegression(class_weight='balanced', random_state=RANDOM_STATE)
+
+# 앙상블 구성
+ensemble_model = VotingClassifier(estimators=[
+    ('catboost', catboost_model),
+    ('xgb', xgb_model),
+    ('lgb', lgb_model),
+    ('logistic', logistic_model)],
+    voting='soft', weights=[2, 1.5, 1.5, 1])
+
+# 앙상블 모델 학습 및 평가
+ensemble_model.fit(train_x_rfe, train_y)
+val_pred_ensemble = ensemble_model.predict(val_x_rfe)
+f1_ensemble = f1_score(val_y, val_pred_ensemble)
+print(f"Ensemble Validation F1 Score: {f1_ensemble}")
+
+# 테스트 데이터 전처리 및 예측
+test_x = test_data[features]
+test_x = scaler.transform(test_x)
+test_x_rfe = test_x[:, rfe_selector.support_]
+test_pred_ensemble = ensemble_model.predict(test_x_rfe)
+
+# 결과를 submission.csv에 저장
+submission = pd.read_csv("submission.csv")
+submission["target"] = ['Normal' if pred == 0 else 'AbNormal' for pred in test_pred_ensemble]
+submission.to_csv("submission.csv", index=False)
+
+print("Predictions saved to submission.csv")
